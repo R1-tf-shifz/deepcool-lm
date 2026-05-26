@@ -3,6 +3,8 @@
 Deepcool LM360 LCD Driver - Unified CLI Tool
 Supports system monitoring, brightness control, and custom image rendering
 """
+
+from os.path import basename
 import usb.core
 import usb.util
 import sys
@@ -12,8 +14,10 @@ import psutil
 import socket
 import json
 import os
+import io
+import pickle
 import threading
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageSequence
 
 VENDOR_ID = 0x3633
 PRODUCT_ID = 0x0026
@@ -22,39 +26,52 @@ WIDTH = 320
 HEIGHT = 240
 
 # Frame header that works
-FRAME_HEADER = bytes([0xaa, 0x08, 0x00, 0x00, 0x01, 0x00, 0x58, 0x02, 0x00, 0x2c, 0x01, 0xbc, 0x11])
+FRAME_HEADER = bytes(
+    [0xAA, 0x08, 0x00, 0x00, 0x01, 0x00, 0x58, 0x02, 0x00, 0x2C, 0x01, 0xBC, 0x11]
+)
 
 # IPC socket path
 SOCKET_PATH = "/var/run/deepcool-lm.sock"
 
+
 class DisplayState:
     """Manages the current display state"""
+
     def __init__(self):
-        self.mode = 'monitor'  # 'monitor', 'image', 'solid'
+        self.mode = "monitor"  # 'monitor', 'image', 'solid'
         self.data = None  # Store image framebuffer or color
         self.lock = threading.Lock()
+        self.fps = None  # Store fps for gif
 
     def set_monitor_mode(self):
         with self.lock:
-            self.mode = 'monitor'
+            self.mode = "monitor"
             self.data = None
 
     def set_image_mode(self, framebuffer):
         with self.lock:
-            self.mode = 'image'
+            self.mode = "image"
             self.data = framebuffer
+
+    def set_gif_mode(self, buffers, fps):
+        with self.lock:
+            self.mode = "gif"
+            self.data = buffers
+            self.fps = fps
 
     def set_solid_mode(self, framebuffer):
         with self.lock:
-            self.mode = 'solid'
+            self.mode = "solid"
             self.data = framebuffer
 
     def get_state(self):
         with self.lock:
-            return self.mode, self.data
+            return self.mode, self.data, self.fps
+
 
 class IPCServer:
     """Unix socket server for IPC communication"""
+
     def __init__(self, device, display_state):
         self.device = device
         self.display_state = display_state
@@ -95,7 +112,7 @@ class IPCServer:
         """Handle a single client request"""
         try:
             # Receive command (max 10MB for images)
-            data = b''
+            data = b""
             while True:
                 chunk = conn.recv(4096)
                 if not chunk:
@@ -108,42 +125,57 @@ class IPCServer:
                 return
 
             # Parse command
-            cmd = json.loads(data.decode('utf-8'))
-            action = cmd.get('action')
+            cmd = json.loads(data.decode("utf-8"))
+            action = cmd.get("action")
 
             # Execute command
-            response = {'status': 'ok'}
+            response = {"status": "ok"}
 
-            if action == 'brightness_up':
+            if action == "brightness_up":
                 self.device.brightness_up()
-            elif action == 'brightness_down':
+            elif action == "brightness_down":
                 self.device.brightness_down()
-            elif action == 'monitor':
+            elif action == "monitor":
                 # Switch back to monitor mode
                 self.display_state.set_monitor_mode()
-            elif action == 'image':
+            elif action == "image":
                 # Image data is base64 encoded in the command
                 import base64
-                img_data = base64.b64decode(cmd['data'])
+
+                img_data = base64.b64decode(cmd["data"])
                 from io import BytesIO
+
                 img = Image.open(BytesIO(img_data))
                 framebuffer = rgb_to_framebuffer(img)
                 self.display_state.set_image_mode(framebuffer)
-            elif action == 'solid':
-                color = tuple(cmd['color'])
-                img = Image.new('RGB', (WIDTH, HEIGHT), color=color)
+            elif action == "solid":
+                color = tuple(cmd["color"])
+                img = Image.new("RGB", (WIDTH, HEIGHT), color=color)
                 framebuffer = rgb_to_framebuffer(img)
                 self.display_state.set_solid_mode(framebuffer)
+            elif action == "gif":
+                import base64
+
+                gif_data = base64.b64decode(cmd["data"])
+                from io import BytesIO
+
+                restored_data = pickle.loads(gif_data)
+                gif_bytes = base64.b64decode(restored_data[0])
+                gif = Image.open(BytesIO(gif_bytes))
+                fps = restored_data[1]
+                buffers = process_gif(gif)
+                # print(f"buffers: {buffers.__len__()}", file=sys.stderr)
+                self.display_state.set_gif_mode(buffers, fps)
             else:
-                response = {'status': 'error', 'message': f'Unknown action: {action}'}
+                response = {"status": "error", "message": f"Unknown action: {action}"}
 
             # Send response
-            conn.sendall(json.dumps(response).encode('utf-8'))
+            conn.sendall(json.dumps(response).encode("utf-8"))
 
         except Exception as e:
-            error_response = {'status': 'error', 'message': str(e)}
+            error_response = {"status": "error", "message": str(e)}
             try:
-                conn.sendall(json.dumps(error_response).encode('utf-8'))
+                conn.sendall(json.dumps(error_response).encode("utf-8"))
             except:
                 pass
         finally:
@@ -159,16 +191,17 @@ class IPCServer:
         except:
             pass
 
+
 def send_ipc_command(cmd):
     """Send a command to the running service via IPC"""
     try:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.connect(SOCKET_PATH)
-        sock.sendall(json.dumps(cmd).encode('utf-8'))
+        sock.sendall(json.dumps(cmd).encode("utf-8"))
         sock.shutdown(socket.SHUT_WR)
 
         # Receive response
-        response = b''
+        response = b""
         while True:
             chunk = sock.recv(4096)
             if not chunk:
@@ -176,11 +209,12 @@ def send_ipc_command(cmd):
             response += chunk
 
         sock.close()
-        return json.loads(response.decode('utf-8'))
+        return json.loads(response.decode("utf-8"))
     except FileNotFoundError:
         return None  # Service not running
     except Exception as e:
-        return {'status': 'error', 'message': str(e)}
+        return {"status": "error", "message": str(e)}
+
 
 class LM360:
     def __init__(self):
@@ -217,22 +251,22 @@ class LM360:
 
     def brightness_up(self):
         """Increase brightness"""
-        cmd = bytes([0xaa, 0x04, 0x00, 0x06, 0x03, 0x61, 0x00, 0xd2, 0x46])
+        cmd = bytes([0xAA, 0x04, 0x00, 0x06, 0x03, 0x61, 0x00, 0xD2, 0x46])
         self.write(cmd)
 
     def brightness_down(self):
         """Decrease brightness"""
-        cmd = bytes([0xaa, 0x04, 0x00, 0x06, 0x03, 0x1d, 0x00, 0xe6, 0x0b])
+        cmd = bytes([0xAA, 0x04, 0x00, 0x06, 0x03, 0x1D, 0x00, 0xE6, 0x0B])
         self.write(cmd)
 
     def zen_mode_toggle(self):
         """Toggle Zen mode (screen off/on)"""
-        cmd = bytes([0xaa, 0x04, 0x00, 0x03, 0x00, 0x00, 0x00, 0xdc, 0x9b])
+        cmd = bytes([0xAA, 0x04, 0x00, 0x03, 0x00, 0x00, 0x00, 0xDC, 0x9B])
         self.write(cmd)
 
     def init_query(self):
         """Send init/query command"""
-        cmd = bytes([0xaa, 0x01, 0x00, 0x09, 0x29, 0x91])
+        cmd = bytes([0xAA, 0x01, 0x00, 0x09, 0x29, 0x91])
         self.write(cmd)
 
     def usb_reset(self):
@@ -251,9 +285,11 @@ class LM360:
             except:
                 pass
 
+
 # ============================================================================
 # System Info & Rendering Functions
 # ============================================================================
+
 
 def get_temp_color(temp):
     """Return color gradient based on temperature"""
@@ -262,59 +298,66 @@ def get_temp_color(temp):
     elif temp < 60:
         return (100, 255, 100)  # Green
     elif temp < 75:
-        return (255, 220, 50)   # Yellow
+        return (255, 220, 50)  # Yellow
     elif temp < 85:
-        return (255, 140, 0)    # Orange
+        return (255, 140, 0)  # Orange
     else:
-        return (255, 50, 50)    # Red
+        return (255, 50, 50)  # Red
+
 
 def load_fonts():
     """Load fonts with fallback"""
     try:
         return {
-            'medium': ImageFont.truetype("/usr/share/fonts/TTF/DejaVuSans-Bold.ttf", 40),
-            'normal': ImageFont.truetype("/usr/share/fonts/TTF/DejaVuSans.ttf", 26),
-            'normal_bold': ImageFont.truetype("/usr/share/fonts/TTF/DejaVuSans-Bold.ttf", 26),
-            'small': ImageFont.truetype("/usr/share/fonts/TTF/DejaVuSans.ttf", 20),
+            "medium": ImageFont.truetype(
+                "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf", 40
+            ),
+            "normal": ImageFont.truetype("/usr/share/fonts/TTF/DejaVuSans.ttf", 26),
+            "normal_bold": ImageFont.truetype(
+                "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf", 26
+            ),
+            "small": ImageFont.truetype("/usr/share/fonts/TTF/DejaVuSans.ttf", 20),
         }
     except:
         default = ImageFont.load_default()
-        return {k: default for k in ['medium', 'normal', 'normal_bold', 'small']}
+        return {k: default for k in ["medium", "normal", "normal_bold", "small"]}
+
 
 def get_system_info():
     """Get all system information"""
     info = {
-        'cpu_temp': 0.0,
-        'gpu_temp': 0.0,
-        'cpu_percent': 0.0,
-        'cpu_freq': 0.0,
+        "cpu_temp": 0.0,
+        "gpu_temp": 0.0,
+        "cpu_percent": 0.0,
+        "cpu_freq": 0.0,
     }
 
     # CPU temperature
     try:
         temps = psutil.sensors_temperatures()
-        if 'coretemp' in temps and len(temps['coretemp']) > 0:
-            info['cpu_temp'] = round(temps['coretemp'][0].current, 1)
-        if 'nvme' in temps and len(temps['nvme']) > 0:
-            info['gpu_temp'] = round(temps['nvme'][0].current, 1)
+        if "coretemp" in temps and len(temps["coretemp"]) > 0:
+            info["cpu_temp"] = round(temps["coretemp"][0].current, 1)
+        if "nvme" in temps and len(temps["nvme"]) > 0:
+            info["gpu_temp"] = round(temps["nvme"][0].current, 1)
     except:
         pass
 
     # CPU usage and frequency
     try:
-        info['cpu_percent'] = round(psutil.cpu_percent(interval=0.1), 1)
+        info["cpu_percent"] = round(psutil.cpu_percent(interval=0.1), 1)
         freq = psutil.cpu_freq()
         if freq:
-            info['cpu_freq'] = round(freq.current / 1000, 2)
+            info["cpu_freq"] = round(freq.current / 1000, 2)
     except:
         pass
 
     return info
 
+
 def rgb_to_framebuffer(img):
     """Convert PIL RGB image to RGB565 framebuffer"""
-    if img.mode != 'RGB':
-        img = img.convert('RGB')
+    if img.mode != "RGB":
+        img = img.convert("RGB")
     if img.size != (WIDTH, HEIGHT):
         img = img.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
 
@@ -335,73 +378,130 @@ def rgb_to_framebuffer(img):
 
     return bytes(framebuffer)
 
+
 def draw_rounded_rect(draw, xy, radius, fill=None, outline=None, width=1):
     """Draw a rounded rectangle using PIL's built-in method"""
     draw.rounded_rectangle(xy, radius=radius, fill=fill, outline=outline, width=width)
 
+
 def render_monitor_display(info, fonts):
     """Main monitoring layout with CPU and GPU as 2 equal rows"""
-    img = Image.new('RGB', (WIDTH, HEIGHT), color=(14, 14, 18))
+    img = Image.new("RGB", (WIDTH, HEIGHT), color=(14, 14, 18))
     draw = ImageDraw.Draw(img)
 
     # === CPU SECTION (Top Half) ===
-    cpu_color = get_temp_color(info['cpu_temp'])
+    cpu_color = get_temp_color(info["cpu_temp"])
 
     # CPU rounded border box
     draw_rounded_rect(draw, [12, 10, 308, 125], radius=8, outline=(40, 40, 50), width=2)
 
     # CPU Label (BOLD) with icon and temperature
-    draw.text((20, 20), "⚙ CPU", fill=(110, 110, 130), font=fonts['normal_bold'])
+    draw.text((20, 20), "⚙ CPU", fill=(110, 110, 130), font=fonts["normal_bold"])
 
     cpu_temp_text = f"{info['cpu_temp']:.0f}°"
-    bbox = draw.textbbox((0, 0), cpu_temp_text, font=fonts['medium'])
+    bbox = draw.textbbox((0, 0), cpu_temp_text, font=fonts["medium"])
     text_w = bbox[2] - bbox[0]
-    draw.text((WIDTH - 20 - text_w, 20), cpu_temp_text, fill=cpu_color, font=fonts['medium'])
+    draw.text(
+        (WIDTH - 20 - text_w, 20), cpu_temp_text, fill=cpu_color, font=fonts["medium"]
+    )
 
     # CPU Usage details
     usage_detail = f"Usage: {info['cpu_percent']:.0f}% • {info['cpu_freq']:.2f} GHz"
-    draw.text((20, 68), usage_detail, fill=(130, 130, 150), font=fonts['small'])
+    draw.text((20, 68), usage_detail, fill=(130, 130, 150), font=fonts["small"])
 
     # CPU Progress bar - full width with rounded corners
     bar_x, bar_y, bar_w, bar_h = 23, 93, WIDTH - 46, 18
     bar_radius = bar_h // 2  # Fully rounded (half the height)
-    draw_rounded_rect(draw, [bar_x, bar_y, bar_x + bar_w, bar_y + bar_h],
-                      radius=bar_radius, fill=(30, 30, 38), outline=None)
-    fill_w = int(bar_w * (info['cpu_percent'] / 100.0))
+    draw_rounded_rect(
+        draw,
+        [bar_x, bar_y, bar_x + bar_w, bar_y + bar_h],
+        radius=bar_radius,
+        fill=(30, 30, 38),
+        outline=None,
+    )
+    fill_w = int(bar_w * (info["cpu_percent"] / 100.0))
     if fill_w >= bar_radius * 2:  # Only draw if wide enough for rounded corners
-        bar_color = (100, 180, 255) if info['cpu_percent'] < 75 else (255, 150, 50)
-        draw_rounded_rect(draw, [bar_x, bar_y, bar_x + fill_w, bar_y + bar_h],
-                          radius=bar_radius, fill=bar_color, outline=None)
+        bar_color = (100, 180, 255) if info["cpu_percent"] < 75 else (255, 150, 50)
+        draw_rounded_rect(
+            draw,
+            [bar_x, bar_y, bar_x + fill_w, bar_y + bar_h],
+            radius=bar_radius,
+            fill=bar_color,
+            outline=None,
+        )
 
     # === GPU SECTION (Bottom Half) ===
-    gpu_color = get_temp_color(info['gpu_temp'])
+    gpu_color = get_temp_color(info["gpu_temp"])
 
     # GPU rounded border box
-    draw_rounded_rect(draw, [12, 135, 308, 230], radius=8, outline=(40, 40, 50), width=2)
+    draw_rounded_rect(
+        draw, [12, 135, 308, 230], radius=8, outline=(40, 40, 50), width=2
+    )
 
     # GPU Label (BOLD) with icon and temperature
-    draw.text((20, 145), "▣ GPU", fill=(110, 110, 130), font=fonts['normal_bold'])
+    draw.text((20, 145), "▣ GPU", fill=(110, 110, 130), font=fonts["normal_bold"])
 
     gpu_temp_text = f"{info['gpu_temp']:.0f}°"
-    bbox = draw.textbbox((0, 0), gpu_temp_text, font=fonts['medium'])
+    bbox = draw.textbbox((0, 0), gpu_temp_text, font=fonts["medium"])
     text_w = bbox[2] - bbox[0]
-    draw.text((WIDTH - 20 - text_w, 145), gpu_temp_text, fill=gpu_color, font=fonts['medium'])
+    draw.text(
+        (WIDTH - 20 - text_w, 145), gpu_temp_text, fill=gpu_color, font=fonts["medium"]
+    )
 
     # GPU Temp Progress bar - full width with rounded corners
     bar_x, bar_y, bar_w, bar_h = 23, 200, WIDTH - 46, 18
     bar_radius = bar_h // 2  # Fully rounded (half the height)
-    draw_rounded_rect(draw, [bar_x, bar_y, bar_x + bar_w, bar_y + bar_h],
-                      radius=bar_radius, fill=(30, 30, 38), outline=None)
-    fill_w = int(bar_w * min(info['gpu_temp'] / 100.0, 1.0))
+    draw_rounded_rect(
+        draw,
+        [bar_x, bar_y, bar_x + bar_w, bar_y + bar_h],
+        radius=bar_radius,
+        fill=(30, 30, 38),
+        outline=None,
+    )
+    fill_w = int(bar_w * min(info["gpu_temp"] / 100.0, 1.0))
     if fill_w >= bar_radius * 2:  # Only draw if wide enough for rounded corners
-        draw_rounded_rect(draw, [bar_x, bar_y, bar_x + fill_w, bar_y + bar_h],
-                          radius=bar_radius, fill=gpu_color, outline=None)
+        draw_rounded_rect(
+            draw,
+            [bar_x, bar_y, bar_x + fill_w, bar_y + bar_h],
+            radius=bar_radius,
+            fill=gpu_color,
+            outline=None,
+        )
 
     return rgb_to_framebuffer(img)
+
+
+def process_gif(gif):
+    res = []
+
+    for frame in ImageSequence.Iterator(gif):
+        ram_buffer = io.BytesIO()
+        frame.save(ram_buffer, format="PNG")
+        res.append(ram_buffer)
+
+    return res
+
+
+def gif_loop(buffers, fps, device):
+    sleep_time = 1 / fps
+    counter = 0
+    while True:
+        if counter == buffers.__len__():
+            counter = 0
+        buffer = buffers[counter]
+        buffer.seek(0)
+        frame = Image.open(buffer)
+        framebuffer = rgb_to_framebuffer(frame)
+        device.send_frame(framebuffer)
+        counter += 1
+        print(f"gif mode: {counter}/{buffers.__len__()}", end="\r")
+        time.sleep(sleep_time)
+
 
 # ============================================================================
 # Command Functions
 # ============================================================================
+
 
 def cmd_monitor(device, args):
     """Display system monitoring continuously"""
@@ -424,39 +524,64 @@ def cmd_monitor(device, args):
 
     try:
         frame_count = 0
+        buffers = None
         while True:
             # Check current display mode
-            mode, data = display_state.get_state()
+            mode, data, fps = display_state.get_state()
 
-            if mode == 'monitor':
+            if mode == "monitor":
                 # Generate and display monitoring frame
                 info = get_system_info()
                 framebuffer = render_monitor_display(info, fonts)
                 device.send_frame(framebuffer)
 
                 frame_count += 1
-                print(f"[MONITOR] Frame {frame_count:4d} | CPU: {info['cpu_temp']:5.1f}°C ({info['cpu_percent']:4.1f}%) | GPU: {info['gpu_temp']:5.1f}°C | {info['cpu_freq']:.2f}GHz", end='\r')
-            elif mode in ['image', 'solid']:
+                print(
+                    f"[MONITOR] Frame {frame_count:4d} | CPU: {info['cpu_temp']:5.1f}°C ({info['cpu_percent']:4.1f}%) | GPU: {info['gpu_temp']:5.1f}°C | {info['cpu_freq']:.2f}GHz",
+                    end="\r",
+                )
+            elif mode == "gif":
+                if data:
+                    buffers = data
+
+                buffer = buffers[(frame_count + 1) % (buffers.__len__())]
+                buffer.seek(0)
+                # print(
+                #     f"[GIF] {(frame_count + 1) % (buffers.__len__())}/{buffers.__len__()} | frame: {frame_count} | buffers in None: {buffers is None} | fps: {fps}",
+                #     file=sys.stderr,
+                # )
+                img = Image.open(buffer)
+                framebuffer = rgb_to_framebuffer(img)
+                device.send_frame(framebuffer)
+                frame_count += 1
+            elif mode in ["image", "solid"]:
                 # Display static content
                 if data:
                     device.send_frame(data)
-                    print(f"[{mode.upper()}] Displaying static content...                                                                ", end='\r')
-
-            time.sleep(args.interval)
+                    print(
+                        f"[{mode.upper()}] Displaying static content...                                                                ",
+                        end="\r",
+                    )
+            if mode == "gif":
+                time.sleep(1 / fps)
+            else:
+                time.sleep(args.interval)
     except KeyboardInterrupt:
         print(f"\n\nStopped after {frame_count} frames")
     finally:
         ipc_server.stop()
+
 
 def cmd_image(device, args):
     """Display a custom image"""
     # Try IPC first if service is running
     if device is None:
         import base64
-        with open(args.image, 'rb') as f:
-            img_data = base64.b64encode(f.read()).decode('utf-8')
-        response = send_ipc_command({'action': 'image', 'data': img_data})
-        if response and response.get('status') == 'ok':
+
+        with open(args.image, "rb") as f:
+            img_data = base64.b64encode(f.read()).decode("utf-8")
+        response = send_ipc_command({"action": "image", "data": img_data})
+        if response and response.get("status") == "ok":
             print(f"✓ Displayed image: {args.image}")
             return
         elif response:
@@ -468,7 +593,7 @@ def cmd_image(device, args):
     time.sleep(0.5)
 
     try:
-        img = Image.open(args.image).convert('RGB')
+        img = Image.open(args.image).convert("RGB")
         framebuffer = rgb_to_framebuffer(img)
         device.send_frame(framebuffer)
         print(f"✓ Displayed image: {args.image}")
@@ -476,12 +601,46 @@ def cmd_image(device, args):
         print(f"✗ Error loading image: {e}")
         sys.exit(1)
 
+
+def cmd_gif(device, args):
+    """Display a custom gif"""
+
+    if device is None:
+        import base64
+
+        with open(args.gif, "rb") as f:
+            gif = base64.b64encode(f.read()).decode("utf-8")
+        if args.fps is None:
+            args.fps = 30
+
+        prepared_data = pickle.dumps((gif, args.fps))
+        gif_data = base64.b64encode(prepared_data).decode("utf-8")
+        response = send_ipc_command({"action": "gif", "data": gif_data})
+        if response and response.get("status") == "ok":
+            print(f"✓ Displayed gif: {args.gif}")
+            return
+        elif response:
+            print(f"✗ Error: {response.get('message', 'Unknown error')}")
+            sys.exit(1)
+
+    device.init_query()
+    time.sleep(0.5)
+
+    try:
+        gif = Image.open(args.gif)
+        buffers = process_gif(gif)
+        gif_loop(buffers, args.fps, device)
+    except Exception as e:
+        print(f"✗ Error loading gif: {e}")
+        sys.exit(1)
+
+
 def cmd_solid(device, args):
     """Display solid color"""
     # Try IPC first if service is running
     if device is None:
-        response = send_ipc_command({'action': 'solid', 'color': args.color})
-        if response and response.get('status') == 'ok':
+        response = send_ipc_command({"action": "solid", "color": args.color})
+        if response and response.get("status") == "ok":
             print(f"✓ Displayed solid color: {tuple(args.color)}")
             return
         elif response:
@@ -492,39 +651,44 @@ def cmd_solid(device, args):
     device.init_query()
     time.sleep(0.5)
 
-    img = Image.new('RGB', (WIDTH, HEIGHT), color=tuple(args.color))
+    img = Image.new("RGB", (WIDTH, HEIGHT), color=tuple(args.color))
     framebuffer = rgb_to_framebuffer(img)
     device.send_frame(framebuffer)
     print(f"✓ Displayed solid color: {tuple(args.color)}")
+
 
 def cmd_brightness(device, args):
     """Adjust brightness"""
     # Try IPC first if service is running
     if device is None:
-        action = 'brightness_up' if args.direction == 'up' else 'brightness_down'
-        response = send_ipc_command({'action': action})
-        if response and response.get('status') == 'ok':
-            print(f"✓ Brightness {'increased' if args.direction == 'up' else 'decreased'}")
+        action = "brightness_up" if args.direction == "up" else "brightness_down"
+        response = send_ipc_command({"action": action})
+        if response and response.get("status") == "ok":
+            print(
+                f"✓ Brightness {'increased' if args.direction == 'up' else 'decreased'}"
+            )
             return
         elif response:
             print(f"✗ Error: {response.get('message', 'Unknown error')}")
             sys.exit(1)
 
     # Direct USB access
-    if args.direction == 'up':
+    if args.direction == "up":
         device.brightness_up()
         print("✓ Brightness increased")
     else:
         device.brightness_down()
         print("✓ Brightness decreased")
 
+
 # ============================================================================
 # Main Entry Point
 # ============================================================================
 
+
 def main():
     parser = argparse.ArgumentParser(
-        description='Deepcool LM360 LCD Driver',
+        description="Deepcool LM360 LCD Driver",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -534,27 +698,52 @@ Examples:
   sudo deepcool-lm solid --color 255 0 0    # Display red screen
   sudo deepcool-lm brightness up            # Increase brightness
   sudo deepcool-lm brightness down          # Decrease brightness
-        """
+  sudo deepcool-lm gif /path/to/your.gif    # Display custom gif
+  sudo deepcool-lm
+        gif /path/to/your.gif --fps 60      # Display custom gif with concrete fps
+        """,
     )
 
-    subparsers = parser.add_subparsers(dest='command', help='Command to execute')
+    subparsers = parser.add_subparsers(dest="command", help="Command to execute")
 
     # monitor command
-    monitor_parser = subparsers.add_parser('monitor', help='Display system monitoring')
-    monitor_parser.add_argument('--interval', type=float, default=2.0, help='Update interval in seconds (default: 2.0)')
+    monitor_parser = subparsers.add_parser("monitor", help="Display system monitoring")
+    monitor_parser.add_argument(
+        "--interval",
+        type=float,
+        default=2.0,
+        help="Update interval in seconds (default: 2.0)",
+    )
 
     # image command
-    image_parser = subparsers.add_parser('image', help='Display custom image')
-    image_parser.add_argument('image', help='Path to image file (will be resized to 320x240)')
+    image_parser = subparsers.add_parser("image", help="Display custom image")
+    image_parser.add_argument(
+        "image", help="Path to image file (will be resized to 320x240)"
+    )
 
     # solid command
-    solid_parser = subparsers.add_parser('solid', help='Display solid color')
-    solid_parser.add_argument('--color', type=int, nargs=3, metavar=('R', 'G', 'B'),
-                             default=[0, 0, 0], help='RGB color (0-255)')
+    solid_parser = subparsers.add_parser("solid", help="Display solid color")
+    solid_parser.add_argument(
+        "--color",
+        type=int,
+        nargs=3,
+        metavar=("R", "G", "B"),
+        default=[0, 0, 0],
+        help="RGB color (0-255)",
+    )
+
+    # gif command
+    gif_parser = subparsers.add_parser("gif", help="Display custom gif")
+    gif_parser.add_argument("gif", help="Path to gif file (will be resized to 320x420)")
+    gif_parser.add_argument(
+        "--fps", type=int, default=30, help="FPS for playing gif (default: 30)"
+    )
 
     # brightness command
-    brightness_parser = subparsers.add_parser('brightness', help='Adjust brightness')
-    brightness_parser.add_argument('direction', choices=['up', 'down'], help='Increase or decrease')
+    brightness_parser = subparsers.add_parser("brightness", help="Adjust brightness")
+    brightness_parser.add_argument(
+        "direction", choices=["up", "down"], help="Increase or decrease"
+    )
 
     args = parser.parse_args()
 
@@ -564,7 +753,7 @@ Examples:
 
     # For commands that can use IPC, try that first
     device = None
-    use_ipc_commands = ['image', 'solid', 'brightness', 'monitor']
+    use_ipc_commands = ["image", "solid", "brightness", "monitor", "gif"]
 
     # Check if we should use IPC (service is already running)
     service_running = os.path.exists(SOCKET_PATH)
@@ -574,15 +763,15 @@ Examples:
         device = None  # Signal to command functions to use IPC
 
         # Special case: monitor command via IPC just switches back to monitor mode
-        if args.command == 'monitor':
-            response = send_ipc_command({'action': 'monitor'})
-            if response and response.get('status') == 'ok':
+        if args.command == "monitor":
+            response = send_ipc_command({"action": "monitor"})
+            if response and response.get("status") == "ok":
                 print("✓ Switched to monitoring mode")
                 sys.exit(0)
             else:
                 print("✗ Failed to switch to monitoring mode")
                 sys.exit(1)
-    elif args.command == 'monitor' and not service_running:
+    elif args.command == "monitor" and not service_running:
         # Starting monitor service directly (not via IPC)
         device = LM360()
         if not device.connect():
@@ -603,17 +792,20 @@ Examples:
 
     try:
         # Execute command
-        if args.command == 'monitor':
+        if args.command == "monitor":
             cmd_monitor(device, args)
-        elif args.command == 'image':
+        elif args.command == "image":
             cmd_image(device, args)
-        elif args.command == 'solid':
+        elif args.command == "solid":
             cmd_solid(device, args)
-        elif args.command == 'brightness':
+        elif args.command == "brightness":
             cmd_brightness(device, args)
+        elif args.command == "gif":
+            cmd_gif(device, args)
     finally:
         if device:
             device.disconnect()
+
 
 if __name__ == "__main__":
     main()

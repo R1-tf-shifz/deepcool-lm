@@ -14,7 +14,7 @@ A comprehensive Linux driver for Deepcool LM series AIO coolers with LCD display
 - 🌡️ **Temperature Monitoring** - Real-time CPU and GPU temperature display with color gradients
 - 📊 **Usage Tracking** - CPU usage percentage with animated progress bars
 - ⚡ **CPU Frequency** - Current CPU frequency display
-- 🖼️ **Custom Images** - Display any image on the LCD (auto-resized to 320x240)
+- 🖼️ **Custom Images** - Display any image or gif on the LCD (auto-resized to 320x240)
 - 🔆 **Brightness Control** - Adjust display brightness
 - 🔄 **Persistent State** - Service maintains display mode (monitor/image/color)
 - 🎯 **Clean UI** - Modern design with rounded borders, icons, and smooth progress bars
@@ -141,6 +141,14 @@ sudo deepcool-lm brightness up
 
 # Decrease brightness
 sudo deepcool-lm brightness down
+```
+
+#### Display Custom Gif
+```
+# Display any gif (will be resized to 320x240)
+# Image persists until you switch modes
+sudo deepcool-lm gif /path/to/your.gif
+sudo deepcool-lm gif ~/path/to/your.gif --fps 60
 ```
 
 #### Show Help
