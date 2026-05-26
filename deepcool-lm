@@ -4,7 +4,6 @@ Deepcool LM360 LCD Driver - Unified CLI Tool
 Supports system monitoring, brightness control, and custom image rendering
 """
 
-from os.path import basename
 import usb.core
 import usb.util
 import sys
