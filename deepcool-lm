@@ -474,26 +474,22 @@ def process_gif(gif):
     res = []
 
     for frame in ImageSequence.Iterator(gif):
-        ram_buffer = io.BytesIO()
-        frame.save(ram_buffer, format="PNG")
-        res.append(ram_buffer)
+        prepared_frame = rgb_to_framebuffer(frame)
+        res.append(prepared_frame)
 
     return res
 
 
-def gif_loop(buffers, fps, device):
+def gif_loop(frames, fps, device):
     sleep_time = 1 / fps
     counter = 0
     while True:
-        if counter == buffers.__len__():
+        if counter == frames.__len__():
             counter = 0
-        buffer = buffers[counter]
-        buffer.seek(0)
-        frame = Image.open(buffer)
-        framebuffer = rgb_to_framebuffer(frame)
-        device.send_frame(framebuffer)
+        frame = frames[counter]
+        device.send_frame(frame)
         counter += 1
-        print(f"gif mode: {counter}/{buffers.__len__()}", end="\r")
+        print(f"gif mode: {counter}/{frames.__len__()}", end="\r")
         time.sleep(sleep_time)
 
 
@@ -736,7 +732,7 @@ Examples:
 
     # gif command
     gif_parser = subparsers.add_parser("gif", help="Display custom gif")
-    gif_parser.add_argument("gif", help="Path to gif file (will be resized to 320x420)")
+    gif_parser.add_argument("gif", help="Path to gif file (will be resized to 320x240)")
     gif_parser.add_argument(
         "--fps", type=int, default=30, help="FPS for playing gif (default: 30)"
     )
