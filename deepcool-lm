@@ -13,8 +13,6 @@ import psutil
 import socket
 import json
 import os
-import io
-import pickle
 import threading
 from PIL import Image, ImageDraw, ImageFont, ImageSequence
 
@@ -158,12 +156,11 @@ class IPCServer:
                 gif_data = base64.b64decode(cmd["data"])
                 from io import BytesIO
 
-                restored_data = pickle.loads(gif_data)
+                restored_data = json.loads(gif_data)
                 gif_bytes = base64.b64decode(restored_data[0])
                 gif = Image.open(BytesIO(gif_bytes))
                 fps = restored_data[1]
                 buffers = process_gif(gif)
-                # print(f"buffers: {buffers.__len__()}", file=sys.stderr)
                 self.display_state.set_gif_mode(buffers, fps)
             else:
                 response = {"status": "error", "message": f"Unknown action: {action}"}
@@ -539,15 +536,8 @@ def cmd_monitor(device, args):
                 if data:
                     buffers = data
 
-                buffer = buffers[(frame_count + 1) % (buffers.__len__())]
-                buffer.seek(0)
-                # print(
-                #     f"[GIF] {(frame_count + 1) % (buffers.__len__())}/{buffers.__len__()} | frame: {frame_count} | buffers in None: {buffers is None} | fps: {fps}",
-                #     file=sys.stderr,
-                # )
-                img = Image.open(buffer)
-                framebuffer = rgb_to_framebuffer(img)
-                device.send_frame(framebuffer)
+                frame = buffers[(frame_count + 1) % (buffers.__len__())]
+                device.send_frame(frame)
                 frame_count += 1
             elif mode in ["image", "solid"]:
                 # Display static content
@@ -611,8 +601,8 @@ def cmd_gif(device, args):
             print("✗ Error: FPS must be greater than zero")
             sys.exit(1)
 
-        prepared_data = pickle.dumps((gif, args.fps))
-        gif_data = base64.b64encode(prepared_data).decode("utf-8")
+        prepared_data = json.dumps((gif, args.fps))
+        gif_data = base64.b64encode(prepared_data.encode("utf-8")).decode("utf-8")
         response = send_ipc_command({"action": "gif", "data": gif_data})
         if response and response.get("status") == "ok":
             print(f"✓ Displayed gif: {args.gif}")
