@@ -590,16 +590,17 @@ def cmd_image(device, args):
 def cmd_gif(device, args):
     """Display a custom gif"""
 
+    if args.fps is None:
+        args.fps = 30
+    elif args.fps <= 0:
+        print("✗ Error: FPS must be greater than zero")
+        sys.exit(1)
+
     if device is None:
         import base64
 
         with open(args.gif, "rb") as f:
             gif = base64.b64encode(f.read()).decode("utf-8")
-        if args.fps is None:
-            args.fps = 30
-        elif args.fps <= 0:
-            print("✗ Error: FPS must be greater than zero")
-            sys.exit(1)
 
         prepared_data = json.dumps((gif, args.fps))
         gif_data = base64.b64encode(prepared_data.encode("utf-8")).decode("utf-8")
