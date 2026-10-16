@@ -21,6 +21,7 @@ PRODUCT_ID = 0x0026
 EP_OUT = 0x01
 WIDTH = 320
 HEIGHT = 240
+DEFAULT_BG_COLOR = (255, 255, 255)
 
 # Frame header that works
 FRAME_HEADER = bytes(
@@ -351,26 +352,36 @@ def get_system_info():
 
 
 def rgb_to_framebuffer(img):
-    """Convert PIL RGB image to RGB565 framebuffer"""
-    if img.mode != "RGB":
-        img = img.convert("RGB")
+    """Convert PIL image to RGB565 framebuffer with proper alpha handling"""
     if img.size != (WIDTH, HEIGHT):
         img = img.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
 
-    framebuffer = bytearray()
-    pixels = img.load()
+    if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+        alpha_img = img.convert("RGBA")
+        pixel_sample = alpha_img.getpixel((0, 0))
 
-    for y in range(HEIGHT):
-        for x in range(WIDTH):
-            r, g, b = pixels[x, y]
-            # Convert to RGB565
-            r5 = (r >> 3) & 0x1F
-            g6 = (g >> 2) & 0x3F
-            b5 = (b >> 3) & 0x1F
-            rgb565 = (r5 << 11) | (g6 << 5) | b5
-            # Append as little-endian
-            framebuffer.append(rgb565 & 0xFF)
-            framebuffer.append((rgb565 >> 8) & 0xFF)
+        if len(pixel_sample) == 4 and pixel_sample[3] == 0:
+            bg_color = DEFAULT_BG_COLOR
+        else:
+            bg_color = pixel_sample[:3]
+        background = Image.new("RGBA", alpha_img.size, bg_color + (255,))
+        img = Image.alpha_composite(background, alpha_img).convert("RGB")
+    else:
+        img = img.convert("RGB")
+
+    framebuffer = bytearray()
+    raw_data = img.tobytes()
+
+    for i in range(0, len(raw_data), 3):
+        r, g, b = raw_data[i], raw_data[i + 1], raw_data[i + 2]
+
+        r5 = (r >> 3) & 0x1F
+        g6 = (g >> 2) & 0x3F
+        b5 = (b >> 3) & 0x1F
+        rgb565 = (r5 << 11) | (g6 << 5) | b5
+
+        framebuffer.append(rgb565 & 0xFF)
+        framebuffer.append((rgb565 >> 8) & 0xFF)
 
     return bytes(framebuffer)
 
